@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -uo pipefail
+_LIB="$HOME/.local/share/llm-setup/lib"
+[[ -f "$_LIB/colors.sh" ]] || _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib"
+[[ -f "$_LIB/colors.sh" ]] || { echo "llm-setup lib not found — re-run llm-setup" >&2; exit 1; }
+source "$_LIB/colors.sh"
+source "$_LIB/paths.sh"
+
+[[ -f "$CONF_DIR/keys.env" ]] && source "$CONF_DIR/keys.env" 2>/dev/null || true
+
+# ── Ensure Ollama is running + GPU active ─────────────────────────────────────
+source "$MODEL_CONF" 2>/dev/null || true
+[[ -f "$_LIB/gpu-ensure.sh" ]] && source "$_LIB/gpu-ensure.sh" && _gpu_ensure "${OLLAMA_TAG:-}"
+
+# Find the real npm-installed codex binary — not our own wrapper
+_THIS="${BASH_SOURCE[0]}"
+_CODEX=""
+_NPM_PREFIX=$(npm config get prefix 2>/dev/null || true)
+for _p in \
+  "${_NPM_PREFIX:+$_NPM_PREFIX/bin}" \
+  "$HOME/.npm-global/bin" \
+  "$HOME/.local/share/npm/bin" \
+  "/usr/local/bin" \
+  "/usr/bin"; do
+  [[ -z "$_p" ]] && continue
+  [[ -x "$_p/codex" && "$(realpath "$_p/codex" 2>/dev/null)" != "$(realpath "$_THIS" 2>/dev/null)" ]] \
+    && _CODEX="$_p/codex" && break
+done
+[[ -x "$_CODEX" ]] || { echo -e "  ${BRED}✘${NC}  Codex not installed — run: llm-setup" >&2; exit 1; }
+
+source "$MODEL_CONF" 2>/dev/null || true
+
+if [[ "${OPENAI_API_KEY:-ollama}" == "ollama" ]]; then
+  export OPENAI_API_KEY="ollama"
+  export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://127.0.0.1:11434/v1}"
+  _TAG="${OLLAMA_TAG:-qwen3:14b}"
+  # Ensure Ollama is actually running (gpu-ensure handles GPU; this handles no-GPU or lib-missing)
+  if ! curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    printf "  Starting Ollama…"
+    command -v systemctl &>/dev/null && systemctl is-enabled ollama &>/dev/null \
+      && sudo systemctl start ollama 2>/dev/null \
+      || { OLLAMA_NUM_GPU=99 nohup ollama serve >/dev/null 2>&1 & disown $!; }
+    for _i in {1..20}; do
+      curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && { echo " ready"; break; }
+      printf "."; sleep 1
+    done
+  fi
+  echo -e "  ${BGREEN}✔${NC}  Codex → local Ollama  (${_TAG})"
+  echo ""
+  exec "$_CODEX" \
+    --oss \
+    --local-provider ollama \
+    -m "$_TAG" \
+    -c "ollama_base_url=http://127.0.0.1:11434" \
+    -c "model_supports_reasoning=false" \
+    "$@"
+else
+  echo -e "  ${BGREEN}✔${NC}  Codex → OpenAI cloud"
+  echo ""
+  exec "$_CODEX" "$@"
+fi

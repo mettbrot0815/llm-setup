@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+RED=$'\033[0;31m'  GREEN=$'\033[0;32m'  YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m' BOLD=$'\033[1m'      DIM=$'\033[2m'        NC=$'\033[0m'
+BGREEN=$'\033[1;32m' BYELLOW=$'\033[1;33m'
+[[ -t 1 ]] || { RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; NC=''; BGREEN=''; BYELLOW=''; }
+
+CONF="$HOME/.config/llm-setup/model.conf"
+MCP_VENV="$HOME/.local/share/mcp-venv"
+
+echo ""
+echo -e "  ${BOLD}LLM Update${NC}"
+echo ""
+
+# ── Ollama ────────────────────────────────────────────────────────────────────
+echo -e "  ${DIM}Updating Ollama…${NC}"
+if curl -fsSL https://ollama.com/install.sh | sh >/dev/null 2>&1; then
+  echo -e "  ${BGREEN}✔${NC}  Ollama $(ollama --version 2>/dev/null)"
+else
+  echo -e "  ${BYELLOW}⚠${NC}  Ollama update failed (non-fatal)"
+fi
+
+
+# ── MCP packages ──────────────────────────────────────────────────────────────
+if [[ -x "$MCP_VENV/bin/pip" ]]; then
+  echo -e "  ${DIM}Updating MCP packages…${NC}"
+  "$MCP_VENV/bin/pip" install --quiet --upgrade mcpo mcp-server-time 2>/dev/null \
+    && echo -e "  ${BGREEN}✔${NC}  MCP packages updated" \
+    || echo -e "  ${BYELLOW}⚠${NC}  MCP update failed"
+fi
+
+# ── Re-pull active model (skip local GGUF models — they have no Hub manifest) ──
+if [[ -f "$CONF" ]]; then
+  source "$CONF" 2>/dev/null
+  _tag="${OLLAMA_TAG:-}"
+  if [[ -n "$_tag" ]]; then
+    # Detect local GGUF: modelfile FROM line points to a .gguf file
+    _is_local=0
+    if ollama show "$_tag" 2>/dev/null | grep -qi "FROM.*\.gguf"; then
+      _is_local=1
+    fi
+
+    if (( _is_local )); then
+      echo -e "  ${DIM}Skipping pull for local GGUF model: $_tag${NC}"
+    else
+      echo -e "  ${DIM}Re-pulling: $_tag…${NC}"
+      ollama pull "$_tag" \
+        && echo -e "  ${BGREEN}✔${NC}  Model up to date: $_tag" \
+        || echo -e "  ${BYELLOW}⚠${NC}  Model pull failed"
+    fi
+  fi
+fi
+
+echo ""
+echo -e "  ${BGREEN}✔${NC}  Update complete"
+echo -e "  ${DIM}Run: ${CYAN}source ~/.bashrc${NC}${DIM} in current terminal${NC}"
+echo ""

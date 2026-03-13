@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# llm-mcp-stop — stop all mcpo bridges
+set -uo pipefail
+
+CONF="$HOME/.config/llm-setup/mcp.conf"
+[[ -f "$CONF" ]] && source "$CONF"
+PID_DIR="${MCP_PID_DIR:-$HOME/.config/llm-setup/pids}"
+
+stopped=0
+for _pid_file in "$PID_DIR"/mcpo-*.pid; do
+  [[ -f "$_pid_file" ]] || continue
+  _mcp_name=$(basename "$_pid_file" .pid | sed 's/mcpo-//')
+  _mcp_pid=$(cat "$_pid_file" 2>/dev/null)
+  if [[ -n "$_mcp_pid" ]] && kill -0 "$_mcp_pid" 2>/dev/null; then
+    kill "$_mcp_pid" 2>/dev/null && echo "  Stopped mcpo/$_mcp_name (PID $_mcp_pid)"
+    stopped=$(( stopped + 1 ))
+  fi
+  rm -f "$_pid_file"
+done
+
+(( stopped == 0 )) && echo "  No MCP bridges were running."

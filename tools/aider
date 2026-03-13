@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -uo pipefail
+_LIB="$HOME/.local/share/llm-setup/lib"
+[[ -f "$_LIB/colors.sh" ]] || _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib"
+[[ -f "$_LIB/colors.sh" ]] || { echo "llm-setup lib not found — re-run llm-setup" >&2; exit 1; }
+source "$_LIB/colors.sh"
+source "$_LIB/paths.sh"
+
+[[ -f "$CONF_DIR/keys.env" ]] && source "$CONF_DIR/keys.env" 2>/dev/null || true
+
+# ── GPU enforcement ───────────────────────────────────────────────────────────
+source "$MODEL_CONF" 2>/dev/null || true
+[[ -f "$_LIB/gpu-ensure.sh" ]] && source "$_LIB/gpu-ensure.sh" && _gpu_ensure "${OLLAMA_TAG:-}"
+
+_VENV=$(head -1 "$CONF_DIR/agents-venv.txt" 2>/dev/null || echo "")
+_AIDER="${_VENV:+$_VENV/bin/aider}"
+[[ -x "$_AIDER" ]] || { echo -e "  ${BRED}✘${NC}  Aider not installed — run: llm-setup" >&2; exit 1; }
+
+source "$MODEL_CONF" 2>/dev/null || true
+_TAG="${OLLAMA_TAG:-}"
+[[ -n "$_TAG" ]] || { echo -e "  ${BYELLOW}⚠${NC}  No model configured — run: llm-switch" >&2; exit 1; }
+
+if ! curl -sf --max-time 3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+  echo -e "  ${BYELLOW}⚠${NC}  Ollama not running — starting…"
+  command -v systemctl &>/dev/null \
+    && sudo systemctl start ollama 2>/dev/null \
+    || { nohup ollama serve >/dev/null 2>&1 & disown $!; }
+  sleep 3
+fi
+
+echo -e "  ${BGREEN}✔${NC}  Aider → ollama/${_TAG}  (${BOLD}$PWD${NC})"
+echo -e "  ${DIM}Docs: https://aider.chat  |  /help for commands${NC}"
+echo ""
+export OLLAMA_API_BASE="http://127.0.0.1:11434"
+exec "$_AIDER" --model "ollama/${_TAG}" \
+  --openai-api-base "http://127.0.0.1:11434/v1" \
+  --openai-api-key "ollama" \
+  --no-show-model-warnings \
+  --yes-always "$@"

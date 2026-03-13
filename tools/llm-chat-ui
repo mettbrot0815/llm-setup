@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# llm-chat-ui — install or reinstall oterm
+set -uo pipefail
+_LIB="$HOME/.local/share/llm-setup/lib"
+[[ -f "$_LIB/colors.sh" ]] || _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib"
+source "$_LIB/colors.sh"
+source "$_LIB/paths.sh"
+
+OTERM_VENV="$HOME/.local/share/oterm-venv"
+
+if [[ -x "$OTERM_VENV/bin/oterm" ]]; then
+  echo -e "  ${BGREEN}✔${NC}  oterm already installed"
+  echo -e "  ${DIM}Run: chat${NC}"
+  exit 0
+fi
+
+echo -e "  ${BCYAN}→${NC}  Installing oterm…"
+PYTHON_BIN=$(command -v python3)
+[[ -d "$OTERM_VENV" && ! -f "$OTERM_VENV/bin/activate" ]] && rm -rf "$OTERM_VENV"
+"$PYTHON_BIN" -m venv "$OTERM_VENV"
+"$OTERM_VENV/bin/pip" install --no-cache-dir oterm
+
+ln -sf "$OTERM_VENV/bin/oterm" "$HOME/.local/bin/oterm" 2>/dev/null || true
+
+cat > "$HOME/.local/bin/chat" << 'LAUNCHER'
+#!/usr/bin/env bash
+if ! curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+  printf "  Starting Ollama…"
+  if command -v systemctl &>/dev/null && systemctl is-enabled ollama &>/dev/null 2>&1; then
+    sudo systemctl start ollama 2>/dev/null || true
+  else
+    OLLAMA_NUM_GPU=99 nohup ollama serve >/dev/null 2>&1 & disown $!
+  fi
+  for _i in {1..20}; do
+    curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && { echo " ready"; break; }
+    printf "."; sleep 1
+  done
+fi
+_LIB="$HOME/.local/share/llm-setup/lib"
+if [[ -f "$_LIB/gpu-ensure.sh" ]]; then
+  source "$_LIB/colors.sh" 2>/dev/null || true
+  source "$_LIB/paths.sh"  2>/dev/null || true
+  source "$_LIB/gpu-ensure.sh"
+  _model=$(grep OLLAMA_TAG "${CONF_DIR:-$HOME/.config/llm-setup}/model.conf" 2>/dev/null \
+    | cut -d= -f2 | tr -d '"' || echo "")
+  [[ -n "$_model" ]] && _gpu_ensure "$_model"
+fi
+exec "OTERM_BIN"
+LAUNCHER
+sed -i "s|OTERM_BIN|$OTERM_VENV/bin/oterm|" "$HOME/.local/bin/chat"
+chmod +x "$HOME/.local/bin/chat"
+
+echo -e "  ${BGREEN}✔${NC}  oterm installed — run: chat"

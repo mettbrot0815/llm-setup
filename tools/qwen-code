@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# tools/qwen-code — Qwen Code wrapper
+# Free cloud: Qwen OAuth (1000 req/day, browser login, no API key)
+# Local:      Ollama qwen2.5-coder (offline, no limits)
+set -uo pipefail
+
+_LIB="$HOME/.local/share/llm-setup/lib"
+[[ -f "$_LIB/colors.sh" ]] || _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib"
+[[ -f "$_LIB/colors.sh" ]] || { echo "llm-setup lib not found — re-run llm-setup" >&2; exit 1; }
+source "$_LIB/colors.sh"
+source "$_LIB/paths.sh"
+
+[[ -f "$CONF_DIR/keys.env"   ]] && source "$CONF_DIR/keys.env"   2>/dev/null || true
+[[ -f "$CONF_DIR/model.conf" ]] && source "$CONF_DIR/model.conf" 2>/dev/null || true
+
+QWEN_AUTH_MODE="${QWEN_AUTH_MODE:-1}"
+QWEN_LOCAL_MODEL="${QWEN_LOCAL_MODEL:-qwen3:14b}"
+
+# ── Find qwen binary ──────────────────────────────────────────────────────────
+# npm -g installs under nvm go to ~/.nvm/versions/node/vX/bin/ not ~/.local/bin
+_QWEN=$(command -v qwen 2>/dev/null || true)
+
+if [[ -z "$_QWEN" ]]; then
+  # Try sourcing nvm and re-checking (nvm.sh needs set -u disabled)
+  export NVM_DIR="$HOME/.nvm"
+  set +u
+  [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh" 2>/dev/null || true
+  set -u
+  _QWEN=$(command -v qwen 2>/dev/null || true)
+fi
+
+if [[ -z "$_QWEN" ]]; then
+  # Search all nvm node versions for qwen binary
+  for _nvm_bin in "$HOME/.nvm/versions/node"/*/bin/qwen; do
+    [[ -x "$_nvm_bin" ]] && { _QWEN="$_nvm_bin"; break; }
+  done
+fi
+
+if [[ -z "$_QWEN" ]]; then
+  # Search npm global prefix
+  _npm_prefix=$(npm config get prefix 2>/dev/null || true)
+  [[ -x "$_npm_prefix/bin/qwen" ]] && _QWEN="$_npm_prefix/bin/qwen"
+fi
+
+if [[ -z "$_QWEN" ]]; then
+  echo -e "  ${BRED}✘${NC}  qwen not found" >&2
+  echo -e "  Install: npm install -g @qwen-code/qwen-code@latest" >&2
+  echo -e "  Then run: source ~/.bashrc  and retry" >&2
+  # Offer to install now
+  if command -v npm &>/dev/null; then
+    echo -e "  ${CYAN}?${NC}  Install qwen-code now? [Y/n] " >&2
+    read -r _ans
+    if [[ "${_ans,,}" != "n" ]]; then
+      npm install -g @qwen-code/qwen-code@latest >&2
+      _QWEN=$(command -v qwen 2>/dev/null || true)
+      for _nvm_bin in "$HOME/.nvm/versions/node"/*/bin/qwen; do
+        [[ -x "$_nvm_bin" ]] && { _QWEN="$_nvm_bin"; break; }
+      done
+    fi
+  fi
+  [[ -z "$_QWEN" ]] && exit 1
+fi
+
+export QWEN_OLLAMA_KEY="ollama"
+
+# ── GPU enforcement ─────────────────────────────────────────────────────────
+[[ -f "$_LIB/gpu-ensure.sh" ]] && source "$_LIB/gpu-ensure.sh" && _gpu_ensure "$QWEN_LOCAL_MODEL"
+
+
+# ── Ensure settings.json suppresses auth screen on every launch ───────────────
+# Key that controls whether the auth picker shows: security.auth.selectedType
+# We also inject the Ollama provider and pin model.name so /model works.
+_QWEN_SETTINGS="$HOME/.qwen/settings.json"
+export _QWEN_AUTH="$QWEN_AUTH_MODE"
+export _QWEN_MODEL="$QWEN_LOCAL_MODEL"
+python3 - << 'PYEOF'
+import json, os
+
+auth  = os.environ.get("_QWEN_AUTH",  "1")
+model = os.environ.get("_QWEN_MODEL", "qwen3:14b")
+out   = os.path.expanduser("~/.qwen/settings.json")
+os.makedirs(os.path.dirname(out), exist_ok=True)
+
+# Load existing or start fresh — preserve any keys qwen-code manages
+try:
+    cfg = json.load(open(out))
+except Exception:
+    cfg = {}
+
+# Inject the Ollama provider into modelProviders.openai list
+ollama_provider = {
+    "id":          model,
+    "name":        model,
+    "description": "Local Qwen3 via Ollama",
+    "baseUrl":     "http://127.0.0.1:11434/v1",
+    "envKey":      "QWEN_OLLAMA_KEY",
+    "authType":    "openai",
+    "generationConfig": {
+        "contextWindowSize": 32768,
+        "maxOutputTokens":   8192,
+        "temperature":       0.2,
+        "timeout":           600000,
+        "maxRetries":        1,
+        "top_p":             0.9,
+    }
+}
+mp = cfg.setdefault("modelProviders", {})
+existing = mp.get("openai", [])
+# Replace or insert our Ollama provider
+others = [p for p in existing if "11434" not in str(p.get("baseUrl",""))]
+mp["openai"] = others + [ollama_provider]
+
+# THE KEY that hides the auth picker — set to "openai" so it skips the dialog
+cfg.setdefault("security", {})["auth"] = {"selectedType": "openai"}
+
+# Pin the model so it doesn't reset to "Unknown | coder-model"
+cfg["model"] = {"name": model}
+
+# If user chose local-only mode, also set active provider
+if auth == "2":
+    cfg["selectedProvider"] = "openai"
+    cfg["selectedModelId"]  = model
+
+json.dump(cfg, open(out, "w"), indent=2)
+PYEOF
+
+# ── Status line ───────────────────────────────────────────────────────────────
+if [[ "$QWEN_AUTH_MODE" == "2" ]]; then
+  echo -e "  ${BGREEN}✔${NC}  qwen-code → ${BCYAN}local Ollama${NC}  ($QWEN_LOCAL_MODEL)"
+  echo -e "  ${DIM}      Inside qwen: /auth → OpenAI  then  /model → Ollama: $QWEN_LOCAL_MODEL${NC}"
+else
+  echo -e "  ${BGREEN}✔${NC}  qwen-code → ${BYELLOW}Qwen OAuth${NC}  (free: 1,000 req/day)"
+  echo -e "  ${DIM}      quota hit? /auth → OpenAI  then  /model → Ollama: $QWEN_LOCAL_MODEL${NC}"
+fi
+echo ""
+
+# If auth screen appears: select "API Key" → type "ollama" → Enter
+# Then type /model → select "Ollama: $_QWEN_MODEL"
+exec "$_QWEN" "$@"

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# llm-doctor — diagnose the local LLM stack
+set -uo pipefail
+
+RED=$'\033[0;31m'  GREEN=$'\033[0;32m'  YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m' BOLD=$'\033[1m'      DIM=$'\033[2m'        NC=$'\033[0m'
+BGREEN=$'\033[1;32m' BYELLOW=$'\033[1;33m' BCYAN=$'\033[1;36m' BRED=$'\033[1;31m'
+BYLW="$BYELLOW"
+[[ -t 1 ]] || { RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; NC=''; BGREEN=''; BYELLOW=''; BCYAN=''; BRED=''; BYLW=''; }
+
+CONF_DIR="$HOME/.config/llm-setup"
+VENV="$HOME/.local/share/llm-venv"
+OTERM_VENV="$HOME/.local/share/oterm-venv"
+MCP_CONF="$CONF_DIR/mcp.conf"
+[[ -f "$MCP_CONF" ]] && source "$MCP_CONF"
+MCP_TIME_PORT="${MCP_TIME_PORT:-8010}"
+MCP_FS_PORT="${MCP_FS_PORT:-8011}"
+_MCP_VENV="${MCP_VENV:-$HOME/.local/share/mcp-venv}"
+
+PASS=0; FAIL=0; WARN=0
+
+_ok()   { echo -e "  ${BGREEN}✔${NC}  $1"; PASS=$(( PASS+1 )); }
+_fail() { echo -e "  ${BRED}✘${NC}  $1"; FAIL=$(( FAIL+1 )); }
+_warn() { echo -e "  ${BYELLOW}⚠${NC}  $1"; WARN=$(( WARN+1 )); }
+_head() { echo ""; echo -e "  ${BOLD}$1${NC}  ${DIM}────────────────────────────────────${NC}"; }
+
+echo ""
+echo -e "  ${BOLD}LLM Doctor${NC}  ${DIM}─────────────────────────────────────────────────${NC}"
+
+# ── Hardware ──────────────────────────────────────────────────────────────────
+_head "Hardware"
+echo -e "  ${DIM}CPU:${NC}  $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)"
+echo -e "  ${DIM}RAM:${NC}  $(awk '/MemTotal/{printf "%.0f GB", $2/1024/1024}' /proc/meminfo 2>/dev/null)"
+
+if command -v nvidia-smi &>/dev/null; then
+  _gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs)
+  _vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+  _driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | xargs)
+  _ok "NVIDIA GPU: $_gpu  ($(( ${_vram:-0} / 1024 )) GB VRAM, driver ${_driver:-?})"
+else
+  _warn "nvidia-smi not found — no NVIDIA GPU or driver not installed"
+fi
+
+# ── Ollama ────────────────────────────────────────────────────────────────────
+_head "Ollama"
+_oll_bin=$(command -v ollama 2>/dev/null || true)
+if [[ -n "$_oll_bin" && -x "$_oll_bin" ]]; then
+  _ok "Binary: $(ollama --version 2>/dev/null)  ($_oll_bin)"
+elif [[ -n "$_oll_bin" ]]; then
+  _fail "Binary found but not executable: $_oll_bin"
+else
+  _fail "Ollama binary not found"
+fi
+
+if curl -sf --max-time 3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+  _ok "API responding on port 11434"
+  _models=$(ollama list 2>/dev/null | awk 'NR>1 && $1!="" {count++} END{print count+0}')
+  echo -e "  ${DIM}Installed models:${NC}  $_models"
+  ollama list 2>/dev/null | awk 'NR>1 && $1!="" {printf "    ·  %s\n", $1}'
+else
+  _fail "Ollama API not responding — run: ollama serve"
+fi
+
+# ── Chat UI ───────────────────────────────────────────────────────────────────
+_head "Chat UI"
+if [[ -x "$OTERM_VENV/bin/oterm" ]] || command -v oterm &>/dev/null; then
+  _ok "oterm installed"
+else
+  _warn "oterm not installed — run: llm-chat-ui"
+fi
+
+# ── Python ────────────────────────────────────────────────────────────────────
+_head "Python"
+if [[ -f "$VENV/bin/python" ]]; then
+  _ok "venv: $("$VENV/bin/python" --version 2>&1)"
+else
+  _fail "venv not found: $VENV"
+fi
+
+# ── MCP ───────────────────────────────────────────────────────────────────────
+_head "MCP bridges"
+if [[ -x "$_MCP_VENV/bin/mcpo" ]]; then
+  _ok "mcpo present in $_MCP_VENV"
+else
+  _fail "mcpo not found in $_MCP_VENV"
+fi
+
+for _pair in "time:$MCP_TIME_PORT" "filesystem:$MCP_FS_PORT"; do
+  _mcp_name="${_pair%%:*}"
+  _mcp_port="${_pair##*:}"
+  if curl -sf --max-time 2 "http://127.0.0.1:$_mcp_port/openapi.json" >/dev/null 2>&1; then
+    _ok "mcpo/$_mcp_name on port $_mcp_port ✔"
+  else
+    _warn "mcpo/$_mcp_name not running on port $_mcp_port — run: llm-mcp-start"
+  fi
+done
+
+# ── Model config ──────────────────────────────────────────────────────────────
+_head "Configuration"
+if [[ -f "$CONF_DIR/model.conf" ]]; then
+  source "$CONF_DIR/model.conf" 2>/dev/null
+  _ok "Model: ${OLLAMA_TAG:-not set}"
+  echo -e "  ${DIM}GPU layers: ${GPU_LAYERS:-?} / ${MODEL_LAYERS:-?}   Threads: ${HW_THREADS:-?}   Batch: ${BATCH:-?}${NC}"
+else
+  _fail "model.conf not found — run: llm-setup"
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo -e "  ${DIM}Passed: ${GREEN}$PASS${NC}  ${DIM}Warnings: ${BYLW}$WARN${NC}  ${DIM}Failed: ${RED}$FAIL${NC}"
+echo ""
+(( FAIL > 0 )) && echo -e "  Run ${CYAN}llm-setup${NC} to repair the stack."
+echo ""

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# llm-fix-chat — patch the 'chat' launcher to do GPU warmup before oterm
+# Also fixes qwen-code settings.json to stop the auth screen
+set -uo pipefail
+
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/llm-setup}"
+BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+LIB_DIR="$HOME/.local/share/llm-setup/lib"
+OTERM_VENV="$HOME/.local/share/oterm-venv"
+
+# Color fallbacks
+if [[ -f "$LIB_DIR/colors.sh" ]]; then source "$LIB_DIR/colors.sh"; else
+  BGRN=$'\033[1;32m' BYLW=$'\033[1;33m' BCYN=$'\033[1;36m'
+  BOLD=$'\033[1m' DIM=$'\033[2m' NC=$'\033[0m'
+fi
+ok()   { printf "  ${BGRN}✔${NC}  %s\n" "$*"; }
+warn() { printf "  ${BYLW}⚠${NC}  %s\n" "$*"; }
+info() { printf "  ${DIM}·  %s${NC}\n" "$*"; }
+
+# ── Patch 'chat' launcher ─────────────────────────────────────────────────────
+_oterm_bin="$OTERM_VENV/bin/oterm"
+[[ ! -x "$_oterm_bin" ]] && _oterm_bin="$(command -v oterm 2>/dev/null || echo oterm)"
+
+_model=$(grep -oP 'OLLAMA_TAG="\K[^"]+' "$CONFIG_DIR/model.conf" 2>/dev/null \
+       || grep -oP "OLLAMA_TAG='\K[^']+" "$CONFIG_DIR/model.conf" 2>/dev/null \
+       || echo "")
+
+cat > "$BIN_DIR/chat" << LAUNCHER
+#!/usr/bin/env bash
+# GPU warmup before oterm
+_LIB="$LIB_DIR"
+if [[ -f "\$_LIB/gpu-ensure.sh" ]]; then
+  source "\$_LIB/colors.sh"  2>/dev/null || true
+  source "\$_LIB/paths.sh"   2>/dev/null || true
+  source "\$_LIB/gpu-ensure.sh"
+  _m=\$(grep -oP 'OLLAMA_TAG="\K[^"]+' "\${CONF_DIR:-$CONFIG_DIR}/model.conf" 2>/dev/null || echo "$_model")
+  [[ -n "\$_m" ]] && _gpu_ensure "\$_m"
+fi
+exec "$_oterm_bin"
+LAUNCHER
+chmod +x "$BIN_DIR/chat"
+ok "chat launcher patched (GPU warmup + oterm)"
+
+# ── Patch qwen-code settings.json ─────────────────────────────────────────────
+_QWEN_SETTINGS="$HOME/.qwen/settings.json"
+_model_for_qwen=$(grep -oP 'QWEN_LOCAL_MODEL="\K[^"]+' "$CONFIG_DIR/model.conf" 2>/dev/null \
+                || grep -oP "QWEN_LOCAL_MODEL='\K[^']+" "$CONFIG_DIR/model.conf" 2>/dev/null \
+                || echo "$_model")
+
+python3 - << PYEOF
+import json, os
+
+model = "${_model_for_qwen:-qwen3:14b}"
+out   = os.path.expanduser("~/.qwen/settings.json")
+os.makedirs(os.path.dirname(out), exist_ok=True)
+
+try:    cfg = json.load(open(out))
+except: cfg = {}
+
+ollama_provider = {
+    "id": model, "name": model,
+    "description": "Local Qwen3 via Ollama",
+    "baseUrl":  "http://127.0.0.1:11434/v1",
+    "envKey":   "QWEN_OLLAMA_KEY",
+    "authType": "openai",
+    "generationConfig": {
+        "contextWindowSize": 32768,
+        "maxOutputTokens":   8192,
+        "temperature":       0.2,
+        "timeout":           600000,
+        "maxRetries":        1,
+        "top_p":             0.9,
+    }
+}
+
+mp = cfg.setdefault("modelProviders", {})
+others = [p for p in mp.get("openai",[]) if "11434" not in str(p.get("baseUrl",""))]
+mp["openai"] = others + [ollama_provider]
+
+# THE key that hides the auth picker
+cfg.setdefault("security", {})["auth"] = {"selectedType": "openai"}
+
+# Pin model name
+cfg["model"] = {"name": model}
+
+json.dump(cfg, open(out, "w"), indent=2)
+print(f"  \033[1;32m✔\033[0m  qwen-code settings patched (auth screen suppressed, model: {model})")
+PYEOF
+
+echo ""
+info "Run 'chat' to start oterm with GPU warmup"
+info "Run 'qc'   to start qwen-code (auth screen should not appear)"

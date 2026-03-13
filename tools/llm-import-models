@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+# llm-import-models — import Ollama models from an offline folder
+#
+# Expected source layout (native Ollama storage format):
+#   <source>/
+#     blobs/
+#       sha256-78b3b822087d...   (model weights, large files)
+#       sha256-a8cc1361f314...
+#     manifests/
+#       registry.ollama.ai/
+#         library/
+#           qwen3/
+#             14b
+#           gemma3/
+#             9b
+#
+# Ollama target: $OLLAMA_MODELS  (default: ~/.ollama/models)
+#
+# Strategy: hard-link blobs when src/dst are on the same filesystem (instant,
+# zero extra disk space). Fall back to copy if cross-device.
+# Manifests are always copied (tiny files).
+
+set -uo pipefail
+
+_LIB="$HOME/.local/share/llm-setup/lib"
+[[ -f "$_LIB/colors.sh" ]] || _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib"
+[[ -f "$_LIB/colors.sh" ]] || { echo "llm-setup lib not found — re-run llm-setup" >&2; exit 1; }
+source "$_LIB/colors.sh"
+
+ok()   { echo -e "  ${BGREEN}✔${NC}  $1"; }
+fail() { echo -e "  ${BRED}✘${NC}  $1"; }
+warn() { echo -e "  ${BYELLOW}⚠${NC}  $1"; }
+info() { echo -e "  ${DIM}·${NC}  ${DIM}$1${NC}"; }
+_head(){ echo ""; echo -e "  ${BOLD}$1${NC}  ${DIM}────────────────────────────────────────${NC}"; }
+
+OLLAMA_MODELS="${OLLAMA_MODELS:-$HOME/.ollama/models}"
+
+# ── Parse args ────────────────────────────────────────────────────────────────
+_SOURCE=""
+_DRY_RUN=0
+_LINK_MODE="auto"   # auto | copy | link
+
+_usage() {
+  echo ""
+  echo -e "  ${BOLD}llm-import-models${NC} — import Ollama models from an offline folder"
+  echo ""
+  echo -e "  ${BOLD}Usage:${NC}"
+  echo -e "    llm-import-models ${CYAN}<source-folder>${NC} [options]"
+  echo ""
+  echo -e "  ${BOLD}Options:${NC}"
+  echo -e "    ${CYAN}--dry-run${NC}        Preview what would be imported, no changes"
+  echo -e "    ${CYAN}--copy${NC}           Always copy files (safe across drives/filesystems)"
+  echo -e "    ${CYAN}--link${NC}           Always hard-link (fastest, same filesystem only)"
+  echo -e "    ${CYAN}--dest <path>${NC}    Override Ollama models dir (default: $OLLAMA_MODELS)"
+  echo ""
+  echo -e "  ${BOLD}Source layout expected:${NC}"
+  echo -e "    ${DIM}<source>/blobs/sha256-...${NC}"
+  echo -e "    ${DIM}<source>/manifests/registry.ollama.ai/library/<model>/<tag>${NC}"
+  echo ""
+  echo -e "  ${BOLD}Examples:${NC}"
+  echo -e "    llm-import-models /mnt/usb/models"
+  echo -e "    llm-import-models /mnt/usb/models --dry-run"
+  echo -e "    llm-import-models D:/ollama-backup --copy"
+  echo ""
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)   _DRY_RUN=1; shift ;;
+    --copy)      _LINK_MODE="copy"; shift ;;
+    --link)      _LINK_MODE="link"; shift ;;
+    --dest)      OLLAMA_MODELS="$2"; shift 2 ;;
+    --help|-h)   _usage ;;
+    -*)          echo -e "  ${BRED}Unknown option: $1${NC}" >&2; _usage ;;
+    *)           _SOURCE="$1"; shift ;;
+  esac
+done
+
+# ── Interactive source picker if not provided ─────────────────────────────────
+if [[ -z "$_SOURCE" ]]; then
+  echo ""
+  echo -e "  ${BOLD}Import Ollama Models${NC}"
+  echo ""
+  echo -e "  ${DIM}Enter the path to a folder containing${NC} ${CYAN}blobs/${NC} ${DIM}and${NC} ${CYAN}manifests/${NC} ${DIM}subdirectories.${NC}"
+  echo -e "  ${DIM}(This is the native Ollama storage format — copy from ~/.ollama/models on another machine)${NC}"
+  echo ""
+
+  # Suggest common locations (USB mounts, WSL Windows drives)
+  _suggestions=()
+  for _mp in /mnt/[a-z] /mnt/[A-Z] /media/"$USER"/*; do
+    [[ -d "$_mp/blobs" && -d "$_mp/manifests" ]] && _suggestions+=("$_mp")
+    [[ -d "$_mp/models/blobs" ]]                 && _suggestions+=("$_mp/models")
+  done
+  # WSL: check Windows drives
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    for _drv in /mnt/[c-z]; do
+      [[ -d "$_drv/Users" ]] || continue
+      for _p in \
+        "$_drv/Users"/*"/.ollama/models" \
+        "$_drv/ollama/models" \
+        "$_drv/ollama-models"; do
+        [[ -d "$_p/blobs" ]] && _suggestions+=("$_p")
+      done
+    done
+  fi
+
+  if [[ ${#_suggestions[@]} -gt 0 ]]; then
+    echo -e "  ${BOLD}Detected model folders:${NC}"
+    for _i in "${!_suggestions[@]}"; do
+      _blob_count=$(find "${_suggestions[$_i]}/blobs" -maxdepth 1 -name 'sha256-*' 2>/dev/null | wc -l)
+      printf "  ${CYAN}%2d)${NC}  %s  ${DIM}(%d blobs)${NC}\n" \
+        "$(( _i + 1 ))" "${_suggestions[$_i]}" "$_blob_count"
+    done
+    echo ""
+    echo -e "  ${DIM}Or enter a custom path:${NC}"
+  fi
+
+  read -r -p "  Source path: " _SOURCE
+  _SOURCE="${_SOURCE/#\~/$HOME}"   # expand ~ manually
+  [[ -z "$_SOURCE" ]] && { echo "  Cancelled."; exit 0; }
+fi
+
+# ── Validate source ───────────────────────────────────────────────────────────
+echo ""
+echo -e "  ${BOLD}Import Ollama Models${NC}"
+echo ""
+
+_SRC_BLOBS="$_SOURCE/blobs"
+_SRC_MANIFESTS="$_SOURCE/manifests"
+
+if [[ ! -d "$_SOURCE" ]]; then
+  fail "Source folder not found: $_SOURCE"
+  exit 1
+fi
+if [[ ! -d "$_SRC_BLOBS" ]]; then
+  fail "No blobs/ folder in: $_SOURCE"
+  info "Expected: $_SRC_BLOBS"
+  exit 1
+fi
+if [[ ! -d "$_SRC_MANIFESTS" ]]; then
+  fail "No manifests/ folder in: $_SOURCE"
+  info "Expected: $_SRC_MANIFESTS"
+  exit 1
+fi
+
+info "Source:      $_SOURCE"
+info "Destination: $OLLAMA_MODELS"
+(( _DRY_RUN )) && warn "DRY RUN — no files will be written"
+
+# ── Discover what models are in the source ────────────────────────────────────
+_head "Scanning source"
+
+# Count blobs
+_blob_total=$(find "$_SRC_BLOBS" -maxdepth 1 -name 'sha256-*' -type f 2>/dev/null | wc -l)
+info "Blobs found: $_blob_total"
+
+# Parse manifests to show human model names
+_manifest_files=()
+while IFS= read -r -d '' _mf; do
+  _manifest_files+=("$_mf")
+done < <(find "$_SRC_MANIFESTS" -type f ! -name '.*' -print0 2>/dev/null)
+
+if [[ ${#_manifest_files[@]} -eq 0 ]]; then
+  warn "No manifest files found — cannot identify models"
+  warn "Blobs exist but model names won't be registered"
+fi
+
+# Display model list from manifests
+declare -A _model_sizes
+echo ""
+echo -e "  ${DIM}Models in source:${NC}"
+echo -e "  ${DIM}┌────────────────────────────────────┬───────────┐${NC}"
+printf  "  │ %-34s │ %-9s │\n" "Model" "Size"
+echo -e "  ${DIM}├────────────────────────────────────┼───────────┤${NC}"
+
+for _mf in "${_manifest_files[@]}"; do
+  # manifests/registry.ollama.ai/library/qwen3/14b -> "qwen3:14b"
+  _rel="${_mf#$_SRC_MANIFESTS/}"
+  _parts=(${_rel//\// })
+  if (( ${#_parts[@]} >= 4 )); then
+    _model_tag="${_parts[-2]}:${_parts[-1]}"
+  else
+    _model_tag="$_rel"
+  fi
+
+  # Sum blob sizes referenced in manifest
+  _total_bytes=0
+  while IFS= read -r _digest; do
+    _bfile="$_SRC_BLOBS/${_digest/:/'-'}"
+    [[ -f "$_bfile" ]] && _total_bytes=$(( _total_bytes + $(stat -c%s "$_bfile" 2>/dev/null || echo 0) ))
+  done < <(python3 -c "
+import json, sys
+try:
+  d = json.load(open('$_mf'))
+  layers = d.get('layers', [])
+  config = d.get('config', {})
+  digests = [config.get('digest','')] + [l.get('digest','') for l in layers]
+  print('\n'.join(d for d in digests if d))
+except: pass
+" 2>/dev/null)
+
+  _size_disp="?"
+  if (( _total_bytes > 0 )); then
+    if (( _total_bytes >= 1073741824 )); then
+      _size_disp="$(( _total_bytes / 1073741824 )) GB"
+    else
+      _size_disp="$(( _total_bytes / 1048576 )) MB"
+    fi
+  fi
+  _model_sizes["$_model_tag"]="$_size_disp"
+
+  # Already installed?
+  _dst_mf="$OLLAMA_MODELS/manifests/${_rel}"
+  if [[ -f "$_dst_mf" ]]; then
+    printf "  │ ${DIM}%-34s${NC} │ %-9s │ ${DIM}already installed${NC}\n" \
+      "$_model_tag" "$_size_disp"
+  else
+    printf "  │ ${CYAN}%-34s${NC} │ %-9s │\n" "$_model_tag" "$_size_disp"
+  fi
+done
+
+echo -e "  ${DIM}└────────────────────────────────────┴───────────┘${NC}"
+echo ""
+
+# ── Confirm ───────────────────────────────────────────────────────────────────
+if (( ! _DRY_RUN )); then
+  read -r -p "  Proceed with import? [Y/n]: " _confirm
+  [[ "${_confirm,,}" == "n" ]] && { echo "  Cancelled."; exit 0; }
+  echo ""
+fi
+
+# ── Determine link strategy ───────────────────────────────────────────────────
+if [[ "$_LINK_MODE" == "auto" ]]; then
+  _src_dev=$(stat -c%d "$_SRC_BLOBS" 2>/dev/null || echo "0")
+  mkdir -p "$OLLAMA_MODELS/blobs" 2>/dev/null || true
+  _dst_dev=$(stat -c%d "$OLLAMA_MODELS/blobs" 2>/dev/null || echo "1")
+  if [[ "$_src_dev" == "$_dst_dev" && "$_src_dev" != "0" ]]; then
+    _LINK_MODE="link"
+  else
+    _LINK_MODE="copy"
+  fi
+fi
+info "Transfer mode: $_LINK_MODE$( [[ "$_LINK_MODE" == "link" ]] && echo " (instant, same filesystem)" || echo " (copying across devices)")"
+
+# ── Create destination dirs ───────────────────────────────────────────────────
+if (( ! _DRY_RUN )); then
+  mkdir -p "$OLLAMA_MODELS/blobs" || { fail "Cannot create $OLLAMA_MODELS/blobs"; exit 1; }
+fi
+
+# ── Import blobs ──────────────────────────────────────────────────────────────
+_head "Importing blobs"
+
+_blobs_copied=0
+_blobs_skipped=0
+_blobs_failed=0
+_bytes_total=0
+
+_blob_files=()
+while IFS= read -r -d '' _bf; do
+  _blob_files+=("$_bf")
+done < <(find "$_SRC_BLOBS" -maxdepth 1 -name 'sha256-*' -type f -print0 2>/dev/null)
+
+for _blob in "${_blob_files[@]}"; do
+  _bname=$(basename "$_blob")
+  _dst="$OLLAMA_MODELS/blobs/$_bname"
+
+  if [[ -f "$_dst" ]]; then
+    _blobs_skipped=$(( _blobs_skipped + 1 ))
+    continue
+  fi
+
+  _fsize=$(stat -c%s "$_blob" 2>/dev/null || echo 0)
+  _fsize_mb=$(( _fsize / 1048576 ))
+
+  if (( _DRY_RUN )); then
+    info "would $_LINK_MODE: $_bname  (${_fsize_mb} MB)"
+    _blobs_copied=$(( _blobs_copied + 1 ))
+    _bytes_total=$(( _bytes_total + _fsize ))
+    continue
+  fi
+
+  # Show progress for large files (>100MB)
+  if (( _fsize_mb > 100 )); then
+    printf "  ${DIM}·  %-50s  %5s MB${NC}\r" "${_bname:0:50}" "$_fsize_mb"
+  fi
+
+  if [[ "$_LINK_MODE" == "link" ]]; then
+    ln "$_blob" "$_dst" 2>/dev/null
+    _rc=$?
+  else
+    cp "$_blob" "$_dst" 2>/dev/null
+    _rc=$?
+  fi
+
+  if (( _rc == 0 )); then
+    _blobs_copied=$(( _blobs_copied + 1 ))
+    _bytes_total=$(( _bytes_total + _fsize ))
+  else
+    printf "\r\033[2K"
+    warn "Failed to $_LINK_MODE: $_bname"
+    _blobs_failed=$(( _blobs_failed + 1 ))
+  fi
+done
+
+printf "\r\033[2K"
+
+# Summary
+_gb_total=$(( _bytes_total / 1073741824 ))
+_mb_total=$(( (_bytes_total % 1073741824) / 1048576 ))
+ok "Blobs: ${_blobs_copied} imported, ${_blobs_skipped} already present, ${_blobs_failed} failed"
+(( _bytes_total > 0 )) && info "Data transferred: ${_gb_total} GB ${_mb_total} MB"
+
+# ── Import manifests ──────────────────────────────────────────────────────────
+_head "Importing manifests"
+
+_manifests_copied=0
+_manifests_skipped=0
+
+for _mf in "${_manifest_files[@]}"; do
+  _rel="${_mf#$_SRC_MANIFESTS/}"
+  _dst_mf="$OLLAMA_MODELS/manifests/$_rel"
+
+  if [[ -f "$_dst_mf" ]]; then
+    _manifests_skipped=$(( _manifests_skipped + 1 ))
+    continue
+  fi
+
+  if (( _DRY_RUN )); then
+    info "would copy manifest: $_rel"
+    _manifests_copied=$(( _manifests_copied + 1 ))
+    continue
+  fi
+
+  mkdir -p "$(dirname "$_dst_mf")"
+  if cp "$_mf" "$_dst_mf" 2>/dev/null; then
+    _manifests_copied=$(( _manifests_copied + 1 ))
+  else
+    warn "Failed to copy manifest: $_rel"
+  fi
+done
+
+ok "Manifests: ${_manifests_copied} imported, ${_manifests_skipped} already present"
+
+# ── Verify with Ollama ────────────────────────────────────────────────────────
+if (( ! _DRY_RUN )) && (( _manifests_copied > 0 )); then
+  _head "Verifying"
+
+  if curl -sf --max-time 3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    _registered=$(ollama list 2>/dev/null | awk 'NR>1 && $1!="" {print $1}')
+    for _model_tag in "${!_model_sizes[@]}"; do
+      if echo "$_registered" | grep -qF "${_model_tag%%:*}"; then
+        ok "$_model_tag — visible to Ollama ✔"
+      else
+        warn "$_model_tag — not yet visible (Ollama may need restart)"
+      fi
+    done
+  else
+    warn "Ollama not running — start it to verify: ollama serve"
+    info "Then check: ollama list"
+  fi
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+echo ""
+if (( _DRY_RUN )); then
+  echo -e "  ${BYELLOW}DRY RUN complete — no files written${NC}"
+  echo -e "  ${DIM}Remove --dry-run to perform the actual import${NC}"
+else
+  echo -e "  ${BGREEN}✔${NC}  Import complete"
+  echo -e "  ${DIM}Run:${NC}  ollama list"
+  echo -e "  ${DIM}Use:${NC}  llm-switch  ${DIM}(to set a model as default)${NC}"
+fi
+echo ""

@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# fix-gpu.sh — Force Ollama to use your RTX 3060 in WSL2
+# Run: bash fix-gpu.sh
+set -uo pipefail
+
+G='\033[1;32m' Y='\033[1;33m' C='\033[1;36m' B='\033[1m' D='\033[2m' N='\033[0m'
+ok()   { echo -e "  ${G}✔${N}  $1"; }
+warn() { echo -e "  ${Y}⚠${N}  $1"; }
+info() { echo -e "  ${D}·${N}  $1"; }
+die()  { echo -e "  \033[1;31m✘${N}  $1" >&2; exit 1; }
+hdr()  { echo ""; echo -e "  ${C}── $1 ──${N}"; }
+
+echo ""
+echo -e "  ${B}fix-gpu.sh${N}  — RTX 3060 + WSL2 + Ollama"
+echo ""
+
+# ── Preflight ──────────────────────────────────────────────────────────────────
+command -v nvidia-smi &>/dev/null || die "nvidia-smi not found — WSL2 GPU passthrough not configured"
+command -v ollama     &>/dev/null || die "ollama not found — run llm-setup first"
+
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs)
+VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
+ok "GPU found: $GPU_NAME  (${VRAM_MIB} MiB)"
+
+# ── Step 1: WSL2 CUDA stub (libcuda.so) must be first in ldconfig ─────────────
+hdr "Step 1/5  WSL2 CUDA stub"
+WSL_LIB="/usr/lib/wsl/lib"
+if [[ -d "$WSL_LIB" ]]; then
+  echo "$WSL_LIB" | sudo tee /etc/ld.so.conf.d/00-wsl-cuda.conf >/dev/null
+  ok "Pinned $WSL_LIB → /etc/ld.so.conf.d/00-wsl-cuda.conf"
+  # Also make it visible in this shell right now
+  export LD_LIBRARY_PATH="$WSL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  ls "$WSL_LIB"/libcuda* 2>/dev/null | head -3 | while read f; do
+    info "  found: $(basename "$f")"
+  done
+else
+  die "$WSL_LIB not found. Make sure your Windows NVIDIA driver is up to date and WSL2 GPU is enabled."
+fi
+
+# ── Step 2: Register Ollama's bundled CUDA libs ───────────────────────────────
+hdr "Step 2/5  Ollama bundled CUDA"
+OLLAMA_CUDA=""
+for _d in /usr/local/lib/ollama/cuda_v12 /usr/local/lib/ollama/cuda_v11 /usr/local/lib/ollama; do
+  if [[ -d "$_d" ]] && ls "$_d"/libcublas* "$_d"/libcudart* "$_d"/*.so* 2>/dev/null | head -1 &>/dev/null; then
+    OLLAMA_CUDA="$_d"; break
+  fi
+done
+
+if [[ -n "$OLLAMA_CUDA" ]]; then
+  echo "$OLLAMA_CUDA" | sudo tee /etc/ld.so.conf.d/llm-setup-ollama-cuda.conf >/dev/null
+  ok "Registered $OLLAMA_CUDA"
+else
+  # Dump what is there so user can see
+  warn "Ollama CUDA libs not found at expected paths. Contents of /usr/local/lib/ollama/:"
+  ls /usr/local/lib/ollama/ 2>/dev/null || warn "  (directory doesn't exist — Ollama may not be installed)"
+fi
+sudo ldconfig 2>/dev/null || true
+ok "ldconfig refreshed"
+
+# ── Step 3: Verify libcuda.so is resolvable ───────────────────────────────────
+hdr "Step 3/5  CUDA lib resolution"
+if ldconfig -p 2>/dev/null | grep -q "libcuda.so"; then
+  ok "libcuda.so found in ldconfig: $(ldconfig -p | grep 'libcuda.so' | head -1 | xargs)"
+else
+  warn "libcuda.so NOT in ldconfig — Ollama will fall back to CPU"
+  warn "This means your Windows NVIDIA driver is not exposing the WSL2 CUDA stub"
+  warn "Fix: On Windows, update NVIDIA drivers to 520+ and restart WSL:  wsl --shutdown"
+fi
+
+# ── Step 4: Systemd override OLLAMA_NUM_GPU=99 ───────────────────────────────
+hdr "Step 4/5  Systemd GPU override"
+OVERRIDE="/etc/systemd/system/ollama.service.d/override.conf"
+sudo mkdir -p "$(dirname "$OVERRIDE")"
+printf '[Service]\nEnvironment="OLLAMA_NUM_GPU=99"\n' | sudo tee "$OVERRIDE" >/dev/null
+ok "Wrote $OVERRIDE"
+sudo systemctl daemon-reload 2>/dev/null || true
+
+# ── Step 5: Restart Ollama and confirm GPU ────────────────────────────────────
+hdr "Step 5/5  Restart Ollama"
+sudo systemctl restart ollama 2>/dev/null || {
+  # WSL2 without systemd
+  warn "systemctl restart failed — killing and restarting manually"
+  pkill -x ollama 2>/dev/null || true
+  sleep 1
+  OLLAMA_NUM_GPU=99 nohup ollama serve >/tmp/ollama-gpu-fix.log 2>&1 &
+  info "Started Ollama (PID $!)"
+}
+
+info "Waiting for Ollama API…"
+for i in {1..20}; do
+  curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+  sleep 1
+done
+curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 \
+  || die "Ollama API not responding — check: sudo journalctl -u ollama -n 50"
+ok "Ollama API up"
+
+# ── Force-load active model onto GPU ──────────────────────────────────────────
+CONF="$HOME/.config/llm-setup/model.conf"
+TAG=""
+[[ -f "$CONF" ]] && TAG=$(grep '^OLLAMA_TAG=' "$CONF" | cut -d= -f2 | tr -d '"')
+[[ -z "$TAG" ]] && TAG=$(ollama list 2>/dev/null | awk 'NR==2{print $1}')
+
+if [[ -n "$TAG" ]]; then
+  info "Loading $TAG onto GPU (this may take ~30s first time)…"
+  curl -sf --max-time 90 -X POST http://127.0.0.1:11434/api/generate \
+    -d "{\"model\":\"$TAG\",\"prompt\":\"\",\"stream\":false,\"options\":{\"num_gpu\":99}}" \
+    >/dev/null 2>&1 || warn "Model load timed out — try: ollama run $TAG"
+fi
+
+# ── Final report ──────────────────────────────────────────────────────────────
+echo ""
+echo -e "  ${C}══════════════  GPU STATUS  ══════════════${N}"
+echo ""
+
+# Check ollama ps
+PS=$(ollama ps 2>/dev/null || true)
+if [[ -n "$PS" ]]; then
+  echo "$PS"
+  echo ""
+  if echo "$PS" | grep -qi "gpu"; then
+    VUSED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
+    ok "Model is on GPU  (${VUSED} / ${VRAM_MIB} MiB used)"
+  else
+    warn "Model still shows CPU in 'ollama ps'"
+    warn "Check Ollama logs: sudo journalctl -u ollama -n 30 | grep -i 'gpu\\|cuda\\|error'"
+  fi
+else
+  info "No model loaded yet. Test with: ollama run $TAG 'hi'"
+fi
+
+echo ""
+echo -e "  ${D}nvidia-smi:${N}"
+nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu \
+  --format=csv,noheader 2>/dev/null \
+  | awk -F',' '{printf "    %s  |  VRAM: %s / %s  |  GPU util: %s\n",$1,$2,$3,$4}'
+echo ""
+
+echo -e "  ${B}Next steps if still on CPU:${N}"
+echo -e "  ${D}1.${N}  sudo journalctl -u ollama -n 30 | grep -i 'gpu\\|cuda\\|warn\\|error'"
+echo -e "  ${D}2.${N}  ldconfig -p | grep libcuda"
+echo -e "  ${D}3.${N}  On Windows side: update NVIDIA driver to 520+ then: wsl --shutdown"
+echo ""
